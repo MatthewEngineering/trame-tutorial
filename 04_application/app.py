@@ -1,4 +1,6 @@
 import os
+import tempfile
+import base64
 
 from trame.app import get_server
 from trame.ui.vuetify import SinglePageWithDrawerLayout
@@ -14,6 +16,13 @@ from vtkmodules.vtkRenderingCore import (
 )
 from vtkmodules.vtkFiltersCore import vtkContourFilter
 from vtkmodules.vtkIOXML import vtkXMLUnstructuredGridReader
+from vtkmodules.vtkIOLegacy import (
+    vtkPolyDataReader,
+    vtkStructuredPointsReader,
+    vtkStructuredGridReader,
+    vtkUnstructuredGridReader,
+    vtkRectilinearGridReader,
+)
 from vtkmodules.vtkRenderingAnnotation import vtkCubeAxesActor
 
 # Required for interactor initialization
@@ -56,32 +65,100 @@ renderWindowInteractor = vtkRenderWindowInteractor()
 renderWindowInteractor.SetRenderWindow(renderWindow)
 renderWindowInteractor.GetInteractorStyle().SetCurrentStyleToTrackballCamera()
 
-# Read Data
-reader = vtkXMLUnstructuredGridReader()
-reader.SetFileName(os.path.join(CURRENT_DIRECTORY, "../data/disk_out_ref.vtu"))
-reader.Update()
+# Available data files
+DATA_DIR = os.path.join(CURRENT_DIRECTORY, "../data")
+if not os.path.exists(DATA_DIR):
+    # Running in Docker, data is at /app/data
+    DATA_DIR = "/app/data"
 
-# Extract Array/Field information
-dataset_arrays = []
-fields = [
-    (reader.GetOutput().GetPointData(), vtkDataObject.FIELD_ASSOCIATION_POINTS),
-    (reader.GetOutput().GetCellData(), vtkDataObject.FIELD_ASSOCIATION_CELLS),
+AVAILABLE_FILES = [
+    {"text": "Disk Out", "value": "disk_out_ref.vtu"},
+    {"text": "Carotid", "value": "carotid.vtk"},
+    # {"text": "Iron Protein", "value": "ironProt.vtk"},
 ]
-for field in fields:
-    field_arrays, association = field
-    for i in range(field_arrays.GetNumberOfArrays()):
-        array = field_arrays.GetArray(i)
-        array_range = array.GetRange()
-        dataset_arrays.append(
-            {
-                "text": array.GetName(),
-                "value": i,
-                "range": list(array_range),
-                "type": association,
-            }
-        )
-default_array = dataset_arrays[0]
-default_min, default_max = default_array.get("range")
+
+# Global variables for dynamic data loading
+reader = None
+dataset_arrays = []
+default_array = None
+default_min = 0
+default_max = 1
+contour_value = 0.5
+
+
+def load_data_file(filename):
+    """Load a VTK or VTU file and extract array information"""
+    global reader, dataset_arrays, default_array, default_min, default_max, contour_value
+    
+    filepath = os.path.join(DATA_DIR, filename)
+    
+    # Choose reader based on file extension
+    if filename.endswith('.vtu'):
+        reader = vtkXMLUnstructuredGridReader()
+        reader.SetFileName(filepath)
+        reader.Update()
+    elif filename.endswith('.vtk'):
+        # For .vtk files, we need to determine the type first
+        # Try different readers
+        readers_to_try = [
+            vtkPolyDataReader(),
+            vtkStructuredPointsReader(),
+            vtkStructuredGridReader(),
+            vtkUnstructuredGridReader(),
+            vtkRectilinearGridReader(),
+        ]
+        
+        reader = None
+        for test_reader in readers_to_try:
+            test_reader.SetFileName(filepath)
+            test_reader.Update()
+            if test_reader.GetOutput() and test_reader.GetOutput().GetNumberOfPoints() > 0:
+                reader = test_reader
+                break
+        
+        if reader is None:
+            return False
+    else:
+        return False
+    
+    # Extract Array/Field information
+    dataset_arrays = []
+    fields = [
+        (reader.GetOutput().GetPointData(), vtkDataObject.FIELD_ASSOCIATION_POINTS),
+        (reader.GetOutput().GetCellData(), vtkDataObject.FIELD_ASSOCIATION_CELLS),
+    ]
+    for field in fields:
+        field_arrays, association = field
+        for i in range(field_arrays.GetNumberOfArrays()):
+            array = field_arrays.GetArray(i)
+            array_range = array.GetRange()
+            dataset_arrays.append(
+                {
+                    "text": array.GetName(),
+                    "value": i,
+                    "range": list(array_range),
+                    "type": association,
+                }
+            )
+    
+    if dataset_arrays:
+        default_array = dataset_arrays[0]
+        default_min, default_max = default_array.get("range")
+        contour_value = 0.5 * (default_max + default_min)
+    
+    return True
+
+
+# Load initial data file
+if not load_data_file("disk_out_ref.vtu"):
+    print("Error: Could not load initial data file")
+    print(f"Looking for data in: {DATA_DIR}")
+    print(f"Files available: {os.listdir(DATA_DIR) if os.path.exists(DATA_DIR) else 'Directory not found'}")
+    # Set some defaults to prevent crashes
+    dataset_arrays = [{"text": "dummy", "value": 0, "range": [0, 1], "type": vtkDataObject.FIELD_ASSOCIATION_POINTS}]
+    default_array = dataset_arrays[0]
+    default_min, default_max = 0, 1
+    contour_value = 0.5
 
 # Mesh
 mesh_mapper = vtkDataSetMapper()
@@ -174,6 +251,10 @@ state, ctrl = server.state, server.controller
 # State use to track active UI card
 state.setdefault("active_ui", None)
 
+# Initialize upload state variables
+state.upload_success = ""
+state.upload_error = ""
+
 # -----------------------------------------------------------------------------
 # Callbacks
 # -----------------------------------------------------------------------------
@@ -183,6 +264,183 @@ state.setdefault("active_ui", None)
 @state.change("cube_axes_visibility")
 def update_cube_axes_visibility(cube_axes_visibility, **kwargs):
     cube_axes.SetVisibility(cube_axes_visibility)
+    ctrl.view_update()
+
+
+@state.change("uploaded_file")
+def handle_file_upload(uploaded_file, **kwargs):
+    if not uploaded_file:
+        return
+    
+    try:
+        # uploaded_file is a dictionary with 'name', 'size', 'type', and 'content' (base64)
+        file_content = uploaded_file.get("content", "")
+        file_name = uploaded_file.get("name", "uploaded.vtk")
+        
+        # Decode base64 content
+        if file_content.startswith("data:"):
+            # Remove data URL prefix if present
+            file_content = file_content.split(",", 1)[1]
+        
+        file_data = base64.b64decode(file_content)
+        
+        # Save to temporary file
+        temp_dir = tempfile.gettempdir()
+        temp_path = os.path.join(temp_dir, file_name)
+        
+        with open(temp_path, "wb") as f:
+            f.write(file_data)
+        
+        # Choose reader based on file extension
+        if file_name.endswith('.vtu'):
+            new_reader = vtkXMLUnstructuredGridReader()
+            new_reader.SetFileName(temp_path)
+            new_reader.Update()
+        elif file_name.endswith('.vtk'):
+            # For .vtk files, try different readers
+            readers_to_try = [
+                vtkPolyDataReader(),
+                vtkStructuredPointsReader(),
+                vtkStructuredGridReader(),
+                vtkUnstructuredGridReader(),
+                vtkRectilinearGridReader(),
+            ]
+            
+            new_reader = None
+            for test_reader in readers_to_try:
+                test_reader.SetFileName(temp_path)
+                test_reader.Update()
+                if test_reader.GetOutput() and test_reader.GetOutput().GetNumberOfPoints() > 0:
+                    new_reader = test_reader
+                    break
+            
+            if new_reader is None:
+                state.upload_error = "Could not read VTK file. Format may not be supported."
+                return
+        else:
+            state.upload_error = "Unsupported file type. Please upload .vtk or .vtu files."
+            return
+        
+        # Extract Array/Field information
+        global reader, dataset_arrays, default_array, default_min, default_max, contour_value
+        reader = new_reader
+        
+        dataset_arrays = []
+        fields = [
+            (reader.GetOutput().GetPointData(), vtkDataObject.FIELD_ASSOCIATION_POINTS),
+            (reader.GetOutput().GetCellData(), vtkDataObject.FIELD_ASSOCIATION_CELLS),
+        ]
+        for field in fields:
+            field_arrays, association = field
+            for i in range(field_arrays.GetNumberOfArrays()):
+                array = field_arrays.GetArray(i)
+                array_range = array.GetRange()
+                dataset_arrays.append(
+                    {
+                        "text": array.GetName(),
+                        "value": i,
+                        "range": list(array_range),
+                        "type": association,
+                    }
+                )
+        
+        if dataset_arrays:
+            default_array = dataset_arrays[0]
+            default_min, default_max = default_array.get("range")
+            contour_value = 0.5 * (default_max + default_min)
+        else:
+            state.upload_error = "No data arrays found in the uploaded file."
+            return
+        
+        # Update mesh pipeline
+        mesh_mapper.SetInputConnection(reader.GetOutputPort())
+        mesh_mapper.SelectColorArray(default_array.get("text"))
+        mesh_mapper.GetLookupTable().SetRange(default_min, default_max)
+        if default_array.get("type") == vtkDataObject.FIELD_ASSOCIATION_POINTS:
+            mesh_mapper.SetScalarModeToUsePointFieldData()
+        else:
+            mesh_mapper.SetScalarModeToUseCellFieldData()
+        
+        # Update contour pipeline
+        contour.SetInputConnection(reader.GetOutputPort())
+        contour.SetInputArrayToProcess(0, 0, 0, default_array.get("type"), default_array.get("text"))
+        contour.SetValue(0, contour_value)
+        contour_mapper.SelectColorArray(default_array.get("text"))
+        contour_mapper.GetLookupTable().SetRange(default_min, default_max)
+        if default_array.get("type") == vtkDataObject.FIELD_ASSOCIATION_POINTS:
+            contour_mapper.SetScalarModeToUsePointFieldData()
+        else:
+            contour_mapper.SetScalarModeToUseCellFieldData()
+        
+        # Update cube axes
+        cube_axes.SetBounds(mesh_actor.GetBounds())
+        
+        # Update state with new arrays
+        state.array_list = dataset_arrays
+        state.mesh_color_array_idx = 0
+        state.contour_color_array_idx = 0
+        state.contour_by_array_idx = 0
+        state.contour_min = default_min
+        state.contour_max = default_max
+        state.contour_value = contour_value
+        state.contour_step = 0.01 * (default_max - default_min)
+        state.upload_error = ""
+        state.upload_success = f"Successfully loaded {file_name}"
+        
+        # Reset camera and update view
+        renderer.ResetCamera()
+        ctrl.view_reset_camera()
+        ctrl.view_update()
+        
+    except Exception as e:
+        state.upload_error = f"Error loading file: {str(e)}"
+        state.upload_success = ""
+
+
+@state.change("selected_file")
+def update_selected_file(selected_file, **kwargs):
+    if not selected_file:
+        return
+    
+    # Load new data file
+    load_data_file(selected_file)
+    
+    # Update mesh pipeline
+    mesh_mapper.SetInputConnection(reader.GetOutputPort())
+    mesh_mapper.SelectColorArray(default_array.get("text"))
+    mesh_mapper.GetLookupTable().SetRange(default_min, default_max)
+    if default_array.get("type") == vtkDataObject.FIELD_ASSOCIATION_POINTS:
+        mesh_mapper.SetScalarModeToUsePointFieldData()
+    else:
+        mesh_mapper.SetScalarModeToUseCellFieldData()
+    
+    # Update contour pipeline
+    contour.SetInputConnection(reader.GetOutputPort())
+    contour.SetInputArrayToProcess(0, 0, 0, default_array.get("type"), default_array.get("text"))
+    contour.SetValue(0, contour_value)
+    contour_mapper.SelectColorArray(default_array.get("text"))
+    contour_mapper.GetLookupTable().SetRange(default_min, default_max)
+    if default_array.get("type") == vtkDataObject.FIELD_ASSOCIATION_POINTS:
+        contour_mapper.SetScalarModeToUsePointFieldData()
+    else:
+        contour_mapper.SetScalarModeToUseCellFieldData()
+    
+    # Update cube axes
+    cube_axes.SetBounds(mesh_actor.GetBounds())
+    
+    # Update state with new arrays
+    state.array_list = dataset_arrays
+    state.mesh_color_array_idx = 0
+    state.contour_color_array_idx = 0
+    state.contour_by_array_idx = 0
+    state.contour_min = default_min
+    state.contour_max = default_max
+    state.contour_value = contour_value
+    state.contour_step = 0.01 * (default_max - default_min)
+    
+    # Reset camera and update view
+    renderer.ResetCamera()
+    ctrl.view_reset_camera()
     ctrl.view_update()
 
 
@@ -377,6 +635,54 @@ def standard_buttons():
         vuetify.VIcon("mdi-crop-free")
 
 
+def file_selector_card():
+    with vuetify.VCard(classes="mb-2"):
+        vuetify.VCardTitle(
+            "Load Data",
+            classes="grey lighten-1 py-1 grey--text text--darken-3",
+            style="user-select: none",
+        )
+        with vuetify.VCardText(classes="py-2"):
+            vuetify.VSelect(
+                label="Select File",
+                v_model=("selected_file", "disk_out_ref.vtu"),
+                items=("available_files", AVAILABLE_FILES),
+                hide_details=True,
+                dense=True,
+                outlined=True,
+                classes="mb-3",
+            )
+            vuetify.VDivider(classes="my-2")
+            vuetify.VSubheader("Or Upload Your Own", classes="px-0")
+            vuetify.VFileInput(
+                label="Upload VTK/VTU file",
+                v_model=("uploaded_file", None),
+                accept=".vtk,.vtu",
+                hide_details=True,
+                dense=True,
+                outlined=True,
+                prepend_icon="mdi-file-upload",
+                show_size=True,
+                truncate_length=20,
+            )
+            with vuetify.VAlert(
+                v_show="upload_success",
+                type="success",
+                dense=True,
+                text=True,
+                classes="mt-2 mb-0",
+            ):
+                vuetify.VCardText("{{ upload_success }}")
+            with vuetify.VAlert(
+                v_show="upload_error",
+                type="error",
+                dense=True,
+                text=True,
+                classes="mt-2 mb-0",
+            ):
+                vuetify.VCardText("{{ upload_error }}")
+
+
 def pipeline_widget():
     trame.GitTree(
         sources=(
@@ -568,6 +874,8 @@ with SinglePageWithDrawerLayout(server) as layout:
     with layout.drawer as drawer:
         # drawer components
         drawer.width = 325
+        file_selector_card()
+        vuetify.VDivider(classes="mb-2")
         pipeline_widget()
         vuetify.VDivider(classes="mb-2")
         mesh_card()
@@ -590,4 +898,4 @@ with SinglePageWithDrawerLayout(server) as layout:
 # -----------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    server.start()
+    server.start(host="0.0.0.0")

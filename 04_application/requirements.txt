@@ -1,4 +1,5 @@
 trame
+trame-components
 trame-vuetify
 trame-vtk
 vtk
